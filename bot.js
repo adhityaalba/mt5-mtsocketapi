@@ -23,6 +23,7 @@ class SmartSafeBot {
             // Indicators
             emaFast: parseInt(process.env.EMA_FAST_PERIOD) || 50,
             emaSlow: parseInt(process.env.EMA_SLOW_PERIOD) || 200,
+            martingaleMultiplier: parseFloat(process.env.MARTINGALE_MULTIPLIER) || 2.0,
             
             // SL & TP (Points)
             slPoints: parseInt(process.env.STOP_LOSS_POINTS) || 1000,
@@ -39,6 +40,7 @@ class SmartSafeBot {
             atrPeriod: parseInt(process.env.ATR_PERIOD) || 14,
             atrMultiplier: parseFloat(process.env.ATR_MULTIPLIER) || 3.0,
             minStepPoints: parseInt(process.env.MIN_STEP_POINTS) || 500,
+            limitOffset: parseInt(process.env.LIMIT_OFFSET_POINTS) || 150, // Jarak antrean order limit
             
             magic: 888 
         };
@@ -121,6 +123,9 @@ class SmartSafeBot {
 
             // 3. EXIT STRATEGY (Smart Close)
             if (currentLayers > 0) {
+                const firstOrder = myOrders[0];
+                const isBuyGroup = firstOrder.TYPE.includes("BUY");
+
                 // A. Basket Protection
                 const slAmount = (account.BALANCE * (this.config.basketSLPercent / 100)) * -1;
                 if (totalPL <= slAmount || totalPL >= this.config.tpUsd) {
@@ -131,9 +136,9 @@ class SmartSafeBot {
                 }
 
                 // B. SMART PROFIT LOCK (Exit if Momentum Slows)
-                // Jika total profit > $2.00 dan harga menembus ke bawah EMA 50 (Sinyal Lemah)
-                if (totalPL >= 2.0 && price < emaFast) {
-                    console.log(`📉 SMART CLOSE: Momentum Melemah (Price < EMA50) & Profit Terkunci ($${totalPL.toFixed(2)}). Closing...`);
+                const momentumLost = (isBuyGroup && price < emaFast) || (!isBuyGroup && price > emaFast);
+                if (totalPL >= 2.0 && momentumLost) {
+                    console.log(`📉 SMART CLOSE: Momentum Melemah (${isBuyGroup ? 'BUY' : 'SELL'}) & Profit Terkunci ($${totalPL.toFixed(2)}). Closing...`);
                     await this.closeAll(myOrders);
                     this.isRunning = false;
                     return;
@@ -142,12 +147,24 @@ class SmartSafeBot {
                 // C. Trailing Stop (Individual)
                 for (const order of myOrders) {
                     const pointVal = this.config.symbol.includes("XAU") ? 0.01 : 0.00001;
-                    const profitPoints = (order.PRICE_CURRENT - order.PRICE_OPEN) * (this.config.symbol.includes("XAU") ? 100 : 100000);
+                    const isOrderBuy = order.TYPE.includes("BUY");
+                    const profitPoints = isOrderBuy ? 
+                        (order.PRICE_CURRENT - order.PRICE_OPEN) * (this.config.symbol.includes("XAU") ? 100 : 100000) :
+                        (order.PRICE_OPEN - order.PRICE_CURRENT) * (this.config.symbol.includes("XAU") ? 100 : 100000);
 
                     if (profitPoints >= this.config.trailStart) {
-                        const newSL = parseFloat((order.PRICE_CURRENT - (this.config.trailDist * pointVal)).toFixed(2));
+                        const trailPoint = this.config.trailDist * pointVal;
+                        const newSL = isOrderBuy ? 
+                            parseFloat((order.PRICE_CURRENT - trailPoint).toFixed(2)) :
+                            parseFloat((order.PRICE_CURRENT + trailPoint).toFixed(2));
+                        
                         const currentSL = order.SL || 0;
-                        if (newSL > currentSL + (this.config.trailStep * pointVal)) {
+                        const stepVal = this.config.trailStep * pointVal;
+                        
+                        // Buy: Update jika SL naik. Sell: Update jika SL turun.
+                        const shouldUpdate = isOrderBuy ? (newSL > currentSL + stepVal) : (currentSL === 0 || newSL < currentSL - stepVal);
+
+                        if (shouldUpdate) {
                             console.log(`🛡️ Trailing SL Update Ticket #${order.TICKET} to ${newSL}`);
                             await this.sendRequest({
                                 "MSG": "ORDER_MODIFY", "TICKET": order.TICKET, "SL": newSL, "TP": order.TP
@@ -157,26 +174,38 @@ class SmartSafeBot {
                 }
             }
 
-            // 4. ENTRY LOGIC (Buy Trend Only)
-            if (currentLayers < this.config.maxLayers) {
-                const isBullish = price > emaSlow;
+            // 4. LOGIKA ENTRY
+            const isBullish = price > emaSlow; // Harga > EMA 200
+            const isBearish = price < emaSlow; // Harga < EMA 200
 
-                if (currentLayers === 0) {
-                    if (isBullish) {
-                        console.log("🚀 Sinyal Entry: Price > EMA200. Membuka posisi pertama.");
-                        await this.openOrder(price);
-                    }
-                } else {
-                    // DCA Logic
-                    const lastOrder = myOrders[myOrders.length - 1];
-                    const distPoints = Math.abs(price - lastOrder.PRICE_OPEN) * (this.config.symbol.includes("XAU") ? 100 : 100000);
+            if (currentLayers === 0) {
+                // Entry Pertama berdasarkan Tren
+                if (isBullish) {
+                    console.log("🚀 Sinyal BUY: Price > EMA200 (Tren Up). Membuka posisi BUY.");
+                    await this.openOrder(price, this.config.lot, "BUY");
+                } else if (isBearish) {
+                    console.log("🚀 Sinyal SELL: Price < EMA200 (Tren Down). Membuka posisi SELL.");
+                    await this.openOrder(price, this.config.lot, "SELL");
+                }
+            } else {
+                // Logika DCA Martingale (Melanjutkan posisi yang sudah ada)
+                const firstOrder = myOrders[0];
+                const isBuyGroup = firstOrder.TYPE.includes("BUY");
+                const lastOrder = myOrders[myOrders.length - 1];
+                const distPoints = Math.abs(price - lastOrder.PRICE_OPEN) * (this.config.symbol.includes("XAU") ? 100 : 100000);
+                
+                const atrRes = await this.sendRequest({ "MSG": "ATR_INDICATOR", "SYMBOL": this.config.symbol, "TIMEFRAME": "PERIOD_M15", "PERIOD": this.config.atrPeriod });
+                const stepRequired = Math.max(atrRes.VALUE * this.config.atrMultiplier * (this.config.symbol.includes("XAU") ? 100 : 100000), this.config.minStepPoints);
+
+                if (currentLayers < this.config.maxLayers && distPoints >= stepRequired) {
+                    const nextLot = parseFloat((lastOrder.VOLUME * this.config.martingaleMultiplier).toFixed(2));
                     
-                    const atrRes = await this.sendRequest({ "MSG": "ATR_INDICATOR", "SYMBOL": this.config.symbol, "TIMEFRAME": "PERIOD_M15", "PERIOD": this.config.atrPeriod });
-                    const stepRequired = Math.max(atrRes.VALUE * this.config.atrMultiplier * (this.config.symbol.includes("XAU") ? 100 : 100000), this.config.minStepPoints);
-
-                    if (price < lastOrder.PRICE_OPEN && distPoints >= stepRequired) {
-                        console.log(`🛠️ DCA Layer: Dist ${distPoints.toFixed(0)} >= Required ${stepRequired.toFixed(0)}. Adding Layer.`);
-                        await this.openOrder(price);
+                    if (isBuyGroup && price < lastOrder.PRICE_OPEN) {
+                        console.log(`🛠️ DCA BUY: Harga turun, tambah Layer BUY ke-${currentLayers+1} (Lot: ${nextLot})`);
+                        await this.openOrder(price, nextLot, "BUY");
+                    } else if (!isBuyGroup && price > lastOrder.PRICE_OPEN) {
+                        console.log(`🛠️ DCA SELL: Harga naik, tambah Layer SELL ke-${currentLayers+1} (Lot: ${nextLot})`);
+                        await this.openOrder(price, nextLot, "SELL");
                     }
                 }
             }
@@ -188,15 +217,27 @@ class SmartSafeBot {
         }
     }
 
-    async openOrder(currentPrice) {
+    async openOrder(currentPrice, volume, side) {
         const pointVal = this.config.symbol.includes("XAU") ? 0.01 : 0.00001;
-        const slPrice = currentPrice - (this.config.slPoints * pointVal);
-        const tpPrice = currentPrice + (this.config.tpPoints * pointVal);
+        
+        let slPrice, tpPrice, type;
+        
+        if (side === "BUY") {
+            slPrice = currentPrice - (this.config.slPoints * pointVal);
+            tpPrice = currentPrice + (this.config.tpPoints * pointVal);
+            type = this.config.orderMode === 'LIMIT' ? "ORDER_TYPE_BUY_LIMIT" : "ORDER_TYPE_BUY";
+        } else {
+            slPrice = currentPrice + (this.config.slPoints * pointVal);
+            tpPrice = currentPrice - (this.config.tpPoints * pointVal);
+            type = this.config.orderMode === 'LIMIT' ? "ORDER_TYPE_SELL_LIMIT" : "ORDER_TYPE_SELL";
+        }
 
         const cmd = {
             "MSG": "ORDER_SEND",
             "SYMBOL": this.config.symbol,
-            "VOLUME": this.config.lot,
+            "VOLUME": volume,
+            "TYPE": type,
+            "PRICE": currentPrice, // Selalu kirim harga saat ini sebagai referensi
             "MAGIC": this.config.magic,
             "COMMENT": "SafePro_v2",
             "SL": parseFloat(slPrice.toFixed(2)),
@@ -204,12 +245,11 @@ class SmartSafeBot {
         };
 
         if (this.config.orderMode === 'LIMIT') {
-            cmd.TYPE = "ORDER_TYPE_BUY_LIMIT";
-            cmd.PRICE = parseFloat((currentPrice - (150 * pointVal)).toFixed(2));
-            console.log(`Memasang BUY LIMIT di ${cmd.PRICE}`);
+            const offset = this.config.limitOffset * pointVal;
+            cmd.PRICE = side === "BUY" ? parseFloat((currentPrice - offset).toFixed(2)) : parseFloat((currentPrice + offset).toFixed(2));
+            console.log(`🛡️ Memasang ${side} LIMIT di ${cmd.PRICE} (Offset: ${this.config.limitOffset} points)`);
         } else {
-            cmd.TYPE = "ORDER_TYPE_BUY";
-            console.log(`Melakukan MARKET BUY...`);
+            console.log(`🚀 Melakukan MARKET ${side}...`);
         }
 
         const res = await this.sendRequest(cmd);
